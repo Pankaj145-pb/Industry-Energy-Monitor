@@ -1,0 +1,18 @@
+# Data handling & Excel
+pandas
+openpyxl
+
+# Web UI & interactive visualization
+streamlit
+plotly
+
+# Forecasting & Machine Learning
+scikit-learn
+statsmodels
+
+# Reporting & PDF generation
+reportlab
+
+# Offline LLM communication (Ollama)
+requests
+
