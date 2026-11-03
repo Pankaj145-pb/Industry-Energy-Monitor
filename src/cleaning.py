@@ -247,11 +247,7 @@ class EnergyDataProcessor:
         for clean_name, clean_series in clean_cols.items():
             reindexed_df[clean_name] = clean_series
 
-        # Standard alias columns for UI compatibility
-        reindexed_df["load_kw"] = reindexed_df[val_col]
-        reindexed_df["load_kw_clean"] = reindexed_df[f"{val_col}_clean"]
-
-        interpolated_series = reindexed_df["load_kw_clean"]
+        interpolated_series = reindexed_df[f"{val_col}_clean"]
         post_interp_missing_mask = interpolated_series.isna()
         post_interp_missing_count = int(post_interp_missing_mask.sum())
         interpolated_points_count = raw_missing_count - post_interp_missing_count
@@ -261,7 +257,7 @@ class EnergyDataProcessor:
         final_completeness_pct = round(((total_hours - post_interp_missing_count) / total_hours) * 100, 2)
 
         # Outages detection
-        outage_mask = (reindexed_df["load_kw_clean"] <= self.outage_threshold_kw) & (~post_interp_missing_mask)
+        outage_mask = (reindexed_df[f"{val_col}_clean"] <= self.outage_threshold_kw) & (~post_interp_missing_mask)
         total_outage_hours = int(outage_mask.sum())
         max_continuous_outage_hours = calculate_max_continuous_consecutive(outage_mask)
 
@@ -286,9 +282,9 @@ class EnergyDataProcessor:
             "total_outage_hours": int(total_outage_hours),
             "max_continuous_outage_hours": int(max_continuous_outage_hours),
             "outage_threshold_kw": float(self.outage_threshold_kw),
-            "peak_load_kw": float(reindexed_df["load_kw_clean"].max()) if not reindexed_df["load_kw_clean"].dropna().empty else 0.0,
-            "average_load_kw": float(reindexed_df["load_kw_clean"].mean()) if not reindexed_df["load_kw_clean"].dropna().empty else 0.0,
-            "min_load_kw": float(reindexed_df["load_kw_clean"].min()) if not reindexed_df["load_kw_clean"].dropna().empty else 0.0,
+            "peak_metric_value": float(reindexed_df[f"{val_col}_clean"].max()) if not reindexed_df[f"{val_col}_clean"].dropna().empty else 0.0,
+            "average_metric_value": float(reindexed_df[f"{val_col}_clean"].mean()) if not reindexed_df[f"{val_col}_clean"].dropna().empty else 0.0,
+            "min_metric_value": float(reindexed_df[f"{val_col}_clean"].min()) if not reindexed_df[f"{val_col}_clean"].dropna().empty else 0.0,
         }
 
         return reindexed_df, summary

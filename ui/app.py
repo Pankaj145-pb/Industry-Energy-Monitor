@@ -15,6 +15,7 @@ import plotly.graph_objects as go
 from src.config import OUTPUTS_DIR, DATA_DIR, OUTAGE_THRESHOLD_KW
 from src.cleaning import EnergyDataProcessor, get_column_inventory
 from src.detector import detect_industrial_events, resolve_channel, POWER_CANDIDATES, VOLTAGE_CANDIDATES, PF_CANDIDATES, THD_CANDIDATES
+from src.reporter import EnergyReporter
 
 st.set_page_config(
     page_title="Industrial Energy Monitor",
@@ -58,6 +59,12 @@ if not uploaded_file and sample_files:
 
 # Load raw dataframe once to inspect all columns
 active_source = uploaded_file or selected_sample
+if active_source is None:
+    for k in ["clean_df", "audit_summary", "events_df", "raw_df", "active_filename"]:
+        if k in st.session_state:
+            st.session_state[k] = None
+    st.info("👆 Upload a file or pick a sample dataset to begin.")
+    st.stop()
 raw_df = None
 
 if active_source is not None:
@@ -211,7 +218,7 @@ with tab_overview:
         col2.metric("Raw Completeness", f"{summary['raw_completeness_percentage']:.2f}%", f"{summary['raw_missing_hours']}h missing")
         col3.metric("Final Completeness", f"{summary['final_completeness_percentage']:.2f}%", f"+{summary['interpolated_gap_hours']}h recovered", delta_color="normal")
         col4.metric("Total Events Flagged", f"{len(events_df):,}" if events_df is not None else "0", f"{len(events_df[events_df['severity'].isin(['High', 'Critical'])])} Critical/High" if events_df is not None and not events_df.empty else "None")
-        col5.metric("Peak Telemetry", f"{summary['peak_load_kw']:,.1f}", f"Avg: {summary['average_load_kw']:,.1f}")
+        col5.metric("Peak Telemetry", f"{summary.get('peak_metric_value', summary.get('peak_load_kw', 0)):,.1f}", f"Avg: {summary.get('average_metric_value', summary.get('average_load_kw', 0)):,.1f}")
 
         st.divider()
 
@@ -233,7 +240,7 @@ with tab_overview:
                 st.write("**Active Metric Profile:**")
                 st.write(f"- Selected Channel: `{summary['selected_metric_column']}`")
                 st.write(rf"- Outage Hours ($\le$ {summary['outage_threshold_kw']}): `{summary['total_outage_hours']}` hours")
-                st.write(f"- Metric Range: `{summary['min_load_kw']:,.2f}` to `{summary['peak_load_kw']:,.2f}`")
+                st.write(f"- Metric Range: `{summary.get('min_metric_value', summary.get('min_load_kw', 0)):,.2f}` to `{summary.get('peak_metric_value', summary.get('peak_load_kw', 0)):,.2f}`")
 
         # Interactive Plotly Time Series Chart
         st.subheader(f"📈 Reindexed Profile: {summary['selected_metric_column']}")
@@ -241,17 +248,20 @@ with tab_overview:
         plot_df = clean_df.reset_index()
         fig = go.Figure()
 
+        metric_col = summary['selected_metric_column']
+        metric_clean_col = f"{metric_col}_clean"
+
         fig.add_trace(go.Scatter(
             x=plot_df["timestamp"],
-            y=plot_df["load_kw_clean"],
+            y=plot_df[metric_clean_col],
             mode="lines",
-            name=f"{summary['selected_metric_column']} (Cleaned)",
+            name=f"{metric_col} (Cleaned)",
             line=dict(color="#1f77b4", width=1.5)
         ))
 
         fig.add_trace(go.Scatter(
             x=plot_df["timestamp"],
-            y=plot_df["load_kw"],
+            y=plot_df[metric_col],
             mode="markers",
             marker=dict(size=2, color="#2ca02c", opacity=0.4),
             name="Raw Recorded Points"
@@ -264,7 +274,7 @@ with tab_overview:
                 event_points = plot_df[plot_df["timestamp"].isin(crit_events["start_time"])]
                 fig.add_trace(go.Scatter(
                     x=event_points["timestamp"],
-                    y=event_points["load_kw_clean"],
+                    y=event_points[metric_clean_col],
                     mode="markers",
                     marker=dict(size=8, color="#d62728", symbol="triangle-up"),
                     name="Critical / High Events"
@@ -280,25 +290,6 @@ with tab_overview:
             height=450
         )
         st.plotly_chart(fig, use_container_width=True)
-
-        # Data Preview & Quick Export
-        st.subheader("📄 Telemetry Data Preview")
-        preview_col1, preview_col2 = st.columns([2, 1])
-        
-        with preview_col1:
-            st.dataframe(plot_df.head(24), use_container_width=True)
-            
-        with preview_col2:
-            st.write("**Export Cleaned Grid:**")
-            csv_buffer = io.StringIO()
-            clean_df.to_csv(csv_buffer)
-            st.download_button(
-                label="📥 Download Cleaned CSV",
-                data=csv_buffer.getvalue(),
-                file_name=f"cleaned_{summary['selected_metric_column']}_grid.csv",
-                mime="text/csv",
-                use_container_width=True
-            )
 
     else:
         st.info("👈 Please upload an Excel (.xlsx / .csv) file in the sidebar to automatically clean, detect events, and visualize trends.")
@@ -395,7 +386,62 @@ with tab_rag:
 
 with tab_reports:
     st.subheader("📑 Export Audit Artifacts")
-    if summary is not None:
-        st.write("Generate downloadable PDF executive summaries and CSV extracts based on the cleaned grid.")
+    if clean_df is not None and summary is not None:
+        metric_col = summary["selected_metric_column"]
+        daily_df = EnergyReporter.generate_daily_summary(clean_df, metric_col)
+        monthly_df = EnergyReporter.generate_monthly_summary(clean_df, metric_col)
+
+        rep_col1, rep_col2, rep_col3 = st.columns(3)
+
+        with rep_col1:
+            st.markdown("#### 📅 Daily Summary")
+            st.caption("Aggregated daily peak, average, and min load.")
+            daily_csv = io.StringIO()
+            daily_df.to_csv(daily_csv)
+            st.download_button(
+                label="📥 Download Daily Summary (CSV)",
+                data=daily_csv.getvalue(),
+                file_name=f"daily_energy_summary_{metric_col}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+
+        with rep_col2:
+            st.markdown("#### 📊 Monthly Summary")
+            st.caption("Monthly energy consumption and peak profile.")
+            monthly_csv = io.StringIO()
+            monthly_df.to_csv(monthly_csv)
+            st.download_button(
+                label="📥 Download Monthly Summary (CSV)",
+                data=monthly_csv.getvalue(),
+                file_name=f"monthly_energy_summary_{metric_col}.csv",
+                mime="text/csv",
+                use_container_width=True
+            )
+            
+            monthly_pdf_bytes = EnergyReporter.generate_monthly_pdf_report(summary, monthly_df, metric_col)
+            st.download_button(
+                label="📄 Download Monthly Summary (PDF)",
+                data=monthly_pdf_bytes,
+                file_name=f"monthly_energy_summary_{metric_col}.pdf",
+                mime="application/pdf",
+                use_container_width=True
+            )
+
+        with rep_col3:
+            st.markdown("#### ⚠️ Industrial Events")
+            st.caption("All detected outages, trips, PF, and THD events.")
+            if events_df is not None and not events_df.empty:
+                events_export_csv = io.StringIO()
+                events_df.to_csv(events_export_csv, index=False)
+                st.download_button(
+                    label="📥 Download Events (CSV)",
+                    data=events_export_csv.getvalue(),
+                    file_name="detected_industrial_events.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+            else:
+                st.info("No industrial events recorded to export.")
     else:
         st.info("Upload energy telemetry to generate executive audit reports.")
