@@ -15,7 +15,7 @@ for directory in [DATA_DIR, MODELS_DIR, OUTPUTS_DIR]:
 
 # Ollama / Local LLM settings
 OLLAMA_BASE_URL = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL = "llama3:latest"
+DEFAULT_OLLAMA_MODEL = "llama3.2:3b"
 
 # Energy Monitoring Default Parameters
 RESAMPLE_FREQUENCY = "15min"  # Common industrial interval

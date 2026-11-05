@@ -15,4 +15,5 @@ reportlab
 
 # Offline LLM communication (Ollama)
 requests
+ollama
 

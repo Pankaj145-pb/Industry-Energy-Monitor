@@ -16,6 +16,7 @@ from src.config import OUTPUTS_DIR, DATA_DIR, OUTAGE_THRESHOLD_KW
 from src.cleaning import EnergyDataProcessor, get_column_inventory
 from src.detector import detect_industrial_events, resolve_channel, POWER_CANDIDATES, VOLTAGE_CANDIDATES, PF_CANDIDATES, THD_CANDIDATES
 from src.reporter import EnergyReporter
+from src.rag_agent import ask_energy_agent, explain_detected_event, check_ollama_status
 
 st.set_page_config(
     page_title="Industrial Energy Monitor",
@@ -374,15 +375,51 @@ with tab_forecast:
         st.info("Upload energy telemetry to enable predictive forecasting.")
 
 with tab_rag:
-    st.subheader("🤖 Local LLM Energy Advisor (Ollama)")
-    if summary is not None:
-        st.success(f"Context loaded for metric '{summary['selected_metric_column']}' ({summary['final_completeness_percentage']}% completeness).")
-    user_prompt = st.text_input("Ask a question about facility energy usage:", placeholder="e.g. What was our maximum continuous outage duration?")
-    if st.button("Query Local Model"):
-        if summary is not None:
-            st.info("Synthesizing context and querying local Ollama instance...")
-        else:
-            st.warning("Please upload energy data first to provide context for the local AI.")
+    st.subheader("🤖 Local LLM Energy Advisor (Ollama — llama3.2:3b)")
+    
+    # Check Ollama connection status
+    ollama_stat = check_ollama_status()
+    if ollama_stat["online"]:
+        st.success(f"🟢 Local Ollama Online | Target Model: `llama3.2:3b` {'(Ready)' if ollama_stat['target_model_available'] else '(Not Found)'}")
+    else:
+        st.warning("⚠️ Local Ollama is offline. Ensure `ollama serve` is running at `http://localhost:11434`.")
+
+    if clean_df is not None and summary is not None:
+        st.caption(f"Context grounded on `{summary['selected_metric_column']}` ({summary['final_completeness_percentage']}% completeness, {summary['expected_grid_hours']:,}h).")
+        
+        user_prompt = st.text_input(
+            "Ask a question about facility energy usage:",
+            placeholder="e.g. What was our peak active power demand and when did it occur?"
+        )
+        if st.button("Query Local Model", type="primary"):
+            if user_prompt.strip():
+                with st.spinner("Querying local llama3.2:3b model with grounded context..."):
+                    response_text = ask_energy_agent(user_prompt, clean_df, events_df=events_df)
+                    st.markdown("### 💬 Energy Advisor Response")
+                    st.info(response_text)
+            else:
+                st.warning("Please enter a question to ask the local energy advisor.")
+
+        # Event Root-Cause Explanation Assistant
+        if events_df is not None and not events_df.empty:
+            st.divider()
+            st.subheader("🔍 AI Event Root-Cause Diagnoser")
+            st.caption("Select any detected industrial anomaly to generate an AI technical breakdown:")
+            
+            event_options = [
+                f"{i}: {row['event_type']} | {row['start_time']} | Severity: {row['severity']}"
+                for i, row in events_df.iterrows()
+            ]
+            selected_event_idx_str = st.selectbox("Select Anomaly Event to Diagnose", options=event_options)
+            if st.button("Generate Root-Cause Explanation"):
+                selected_idx = int(selected_event_idx_str.split(":")[0])
+                target_event = events_df.iloc[selected_idx]
+                with st.spinner("Analyzing electrical waveform patterns with llama3.2:3b..."):
+                    explanation_text = explain_detected_event(target_event, clean_df)
+                    st.markdown("#### 🛠️ AI Engineering Diagnostic")
+                    st.markdown(explanation_text)
+    else:
+        st.info("Upload energy telemetry to ground the local AI agent with verified plant metrics.")
 
 with tab_reports:
     st.subheader("📑 Export Audit Artifacts")
