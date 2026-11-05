@@ -1,0 +1,519 @@
+# Complete Project Code Explanation: Function by Function & Line by Line
+# Project: Offline Industrial Energy Monitoring & Intelligence Web Application
+# Author: Antigravity Pairing
+# Target Audience: Technical Interviewers, Engineers, and Systems Architects
+
+================================================================================
+TABLE OF CONTENTS
+================================================================================
+1. High-Level Architecture & How Files Relate to Each Other
+2. File 1: src/config.py (Configuration & File Anchors)
+3. File 2: src/cleaning.py (Data Ingestion, Dynamic Schema & 8,760h Reindexing)
+4. File 3: src/detector.py (Industrial Event & Anomaly Detection Engine)
+5. File 4: src/reporter.py (Daily/Monthly Energy Aggregations & PDF Generation)
+6. File 5: ui/app.py (Streamlit Interactive Web Application)
+7. End-to-End Data Lifecycle (Trace of 1 Sample Row from Raw File to UI)
+
+================================================================================
+1. HIGH-LEVEL ARCHITECTURE & HOW FILES RELATE TO EACH OTHER
+================================================================================
+The application is structured into four distinct, loosely coupled layers:
+
+[ Layer 1: Configuration & Environment ]
+  `src/config.py`: Centralizes filesystem directory paths (data, models, outputs)
+  and baseline constants (thresholds, frequencies). It guarantees directories
+  exist on disk so downstream modules never encounter "Directory Not Found" errors.
+
+               │
+               ▼
+[ Layer 2: Ingestion, Standardization & Data Quality ]
+  `src/cleaning.py`: The data gatekeeper. Raw Excel/CSV industrial logs contain
+  over 100 channels with timestamp drift (e.g., 00:00:31, 01:00:15) and packet drops.
+  This module dynamically discovers timestamp and metric columns, reindexes
+  timestamps to an unbroken hourly grid (8,760 hours/year), interpolates minor gaps,
+  and outputs a cleaned DataFrame (`clean_df`) plus an audit summary (`summary`).
+
+               │
+               ▼
+[ Layer 3: Electrical Event Detection & Engineering Analytics ]
+  `src/detector.py`: Takes `clean_df` from `cleaning.py`. Scans across active
+  power, voltage, power factor (PF), and total harmonic distortion (THD). It groups
+  contiguous hourly violations into discrete events (Outages, Load Trips, Poor PF,
+  High THD), computes severity ("Critical", "High", "Medium", "Low"), and returns
+  a structured event log (`events_df`).
+
+  `src/reporter.py`: Takes `clean_df` and `summary`. Computes mathematical rollups
+  (Daily Summary, Monthly Summary) distinguishing Instantaneous Power (Watts)
+  from Accumulated Energy (Wh). Converts monthly metrics into a formatted
+  executive PDF report via ReportLab in-memory.
+
+               │
+               ▼
+[ Layer 4: Interactive Dashboard & UI Presentation ]
+  `ui/app.py`: The user-facing coordinator. Built with Streamlit and Plotly.
+  When a user uploads an Excel file, `app.py`:
+    1. Passes raw data to `cleaning.py` to generate `clean_df`.
+    2. Passes `clean_df` to `detector.py` to generate `events_df`.
+    3. Passes `clean_df` to `reporter.py` to produce CSV/PDF download payloads.
+    4. Renders responsive KPI metric cards, time series load curves with event
+       markers, interactive filterable event tables, and direct report downloads.
+
+================================================================================
+2. FILE 1: src/config.py (CONFIGURATION & FILE ANCHORS)
+================================================================================
+Purpose: Avoids hardcoded paths and centralizes system-wide physical thresholds.
+
+Line-by-Line Breakdown:
+-----------------------
+Line 1:   """Centralized paths and configuration settings for the Energy Monitoring Application."""
+          - Module documentation string explaining file purpose.
+Line 2:   from pathlib import Path
+          - Imports modern object-oriented filesystem path library from Python standard library.
+Line 5:   BASE_DIR = Path(__file__).resolve().parent.parent
+          - `__file__` is `src/config.py`.
+          - `.resolve()` turns relative paths into absolute canonical paths.
+          - `.parent` is the `src/` folder.
+          - `.parent.parent` goes up one level to the project root directory.
+Line 6:   DATA_DIR = BASE_DIR / "data"
+          - Defines path where private Excel/CSV telemetry files reside.
+Line 7:   MODELS_DIR = BASE_DIR / "models"
+          - Defines directory for local cached machine learning / forecasting models.
+Line 8:   OUTPUTS_DIR = BASE_DIR / "outputs"
+          - Defines directory where generated CSV and PDF audit reports are written.
+Line 9:   SRC_DIR = BASE_DIR / "src"
+          - Defines path to source python packages.
+Line 10:  UI_DIR = BASE_DIR / "ui"
+          - Defines path to Streamlit web presentation files.
+Line 13:  for directory in [DATA_DIR, MODELS_DIR, OUTPUTS_DIR]:
+Line 14:      directory.mkdir(parents=True, exist_ok=True)
+          - Iterates through the crucial runtime folders and creates them if they don't
+            already exist (`parents=True` creates parent folders; `exist_ok=True` prevents
+            crashes if the folder is already present).
+Line 17:  OLLAMA_BASE_URL = "http://localhost:11434"
+          - Default HTTP endpoint where local offline Ollama LLM server runs.
+Line 18:  DEFAULT_OLLAMA_MODEL = "llama3:latest"
+          - The local language model name targeted for energy assistant queries.
+Line 21:  RESAMPLE_FREQUENCY = "15min"
+          - Standard industrial telemetry cadence baseline.
+Line 22:  PEAK_HOUR_START = 9
+Line 23:  PEAK_HOUR_END = 18
+          - Peak utility tariff billing hours (9:00 AM to 6:00 PM) common in energy auditing.
+Line 24:  OUTAGE_THRESHOLD_KW = 0.05
+          - Power threshold (50 Watts = 0.05 kW) below which electrical flow is zero.
+Line 25:  ANOMALY_ZSCORE_THRESHOLD = 3.0
+          - Statistical threshold for identifying outliers beyond 3 standard deviations.
+
+How config.py Relates to Others:
+- Imported by `cleaning.py`, `detector.py`, `reporter.py`, and `app.py`.
+- Ensures every component reads and writes to identical, verified filesystem locations.
+
+================================================================================
+3. FILE 2: src/cleaning.py (DATA INGESTION, DYNAMIC SCHEMA & 8,760h REINDEXING)
+================================================================================
+Purpose: The data-engineering core. Takes raw Excel/CSV telemetry and turns it into
+a contiguous, gap-interpolated 8,760-hour yearly dataset with zero hardcoded column dependencies.
+
+Function 1: detect_timestamp_column(df, explicit_col=None) -> str
+------------------------------------------------------------------
+Goal: Dynamically identify which column represents date/time without relying on a rigid name.
+
+Line-by-Line Breakdown:
+Line 16-17: If the caller explicitly gave a column name and it exists in `df.columns`, return it immediately.
+Line 20-22: Loops through all columns; if `pd.api.types.is_datetime64_any_dtype(df[col])` is True,
+            it immediately selects this column because Pandas already identified it as datetime.
+Line 25-28: Declares `ts_keywords` ("timestamp", "datetime", "date_time", "read_time", "ts", "time", etc.).
+Line 29-32: Normalizes each column name (lowercase, stripped spaces, replaced with underscores)
+            and checks if it matches or contains timestamp keywords.
+Line 34-37: Takes a sample of 10 non-null values from that candidate column and tests
+            `pd.to_datetime(sample, errors="coerce")`. If at least 80% (`>= 0.8`) of the sample
+            successfully parses to datetime objects, the column is confirmed as the timestamp.
+Line 41-47: Fallback test: If no keyword matched, loops over all string/object columns, testing
+            whether their sample values parse to datetimes. If so, picks it.
+Line 50:    Final fallback: Defaults to `df.columns[0]` if nothing else parsed.
+
+Function 2: _normalize(col: str) -> str
+---------------------------------------
+Goal: Helper function that converts column names into lowercase, underscore-separated strings
+(e.g., "Active Power (kW)" becomes "active_power_(kw)").
+
+Function 3: get_column_inventory(df, timestamp_col=None, primary_keywords=None) -> Dict
+----------------------------------------------------------------------------------------
+Goal: Profiles all columns in any uploaded dataset (e.g., 101 columns in the cement plant dataset),
+classifying them into numeric telemetry channels vs. categorical metadata, and ranks the primary load metric.
+
+Line-by-Line Breakdown:
+Line 73:    Resolves the timestamp column using `detect_timestamp_column`.
+Line 76-77: Initializes empty lists for numeric columns and categorical columns.
+Line 79-81: Loops through all columns in the dataset. Skips the timestamp column.
+Line 82-83: If pandas recognizes the column as numeric (`is_numeric_dtype`), appends to `numeric_columns`.
+Line 84-93: If stored as string/object, takes 20 sample values and converts via `pd.to_numeric`.
+            If >= 80% parse successfully as numbers, categorizes as numeric; otherwise categorical.
+Line 96-97: Sets up keyword priority list (defaults to: "watts_total", "active_power", "load_kw", "kw", "power", etc.).
+Line 99-107: Loops through keywords and checks if any numeric column matches. For our cement plant data,
+             `watts_total` matches here and becomes `ranked_primary`.
+Line 110-114: Unit-aware regex match (`UNIT_PATTERN`): If no keyword matched, checks column names against
+              standard units (`w`, `kw`, `mw`, `gw`, `wh`, `kwh`, `mwh`, `watt`, `power`).
+Line 117-122: Statistical fallback: If no name matched, computes `.std()` (standard deviation) across all
+              numeric columns; the column with the highest variance is selected (active power demand fluctuates
+              far more than static IDs or registers).
+Line 124-132: Returns a comprehensive dictionary containing timestamp column, primary metric column,
+              list of numeric columns, list of categorical columns, and total column count.
+
+Function 4: calculate_max_continuous_consecutive(condition_series: pd.Series) -> int
+------------------------------------------------------------------------------------
+Goal: Vectorized calculation of the longest unbroken run of `True` values (e.g., longest continuous blackout).
+
+Line-by-Line Breakdown:
+Line 136-137: If the series is empty or has no `True` values, returns 0.
+Line 138:     `blocks = (~condition_series).cumsum()[condition_series]`
+              - `~condition_series` flips False to True and True to False.
+              - `.cumsum()` creates an increasing group number that only changes when the condition breaks.
+              - Indexing `[condition_series]` keeps only the True groups.
+Line 139-141: `.value_counts().max()` finds the count of the largest group and returns it as an integer.
+
+Class: EnergyDataProcessor
+--------------------------
+Goal: Encapsulates Excel/CSV loading, hourly 8,760h continuous grid alignment, gap interpolation,
+and data quality profiling.
+
+Method 1: __init__(self, target_hours=8760, max_interp_gap=3, outage_threshold_kw=0.05)
+- Sets default grid length to 8,760 hours (non-leap year).
+- Sets `max_interp_gap = 3`: Maximum consecutive missing hours eligible for linear interpolation.
+- Sets `outage_threshold_kw = 0.05`: Zero-load baseline threshold.
+
+Method 2: load_excel(self, file_path, sheet_name=0) -> pd.DataFrame
+- Checks if file exists on disk.
+- If extension is `.xlsx`, `.xls`, or `.xlsm`, calls `pd.read_excel`.
+- If extension is `.csv`, calls `pd.read_csv`.
+- Returns raw DataFrame.
+
+Method 3: process_and_reindex_grid(self, df, timestamp_col=None, value_col=None, additional_cols=None)
+Goal: Central transformation function. Converts raw, drifted telemetry into an exact hourly grid.
+
+Line-by-Line Breakdown:
+Line 190-192: Calls `get_column_inventory()` to discover timestamp (`ts_col`) and primary metric (`val_col`).
+Line 195-197: Converts `ts_col` to datetimes via `pd.to_datetime(errors="coerce")`, drops rows where timestamp is NaT.
+Line 199-200: Raises ValueError if no valid timestamps exist.
+Line 203-207: Builds `cols_to_process`: Starts with `val_col`, and appends any user-selected secondary channels
+              (like voltage `vll_avg`, power factor `true_pf_avg`, harmonics `v_R_thd_pct`).
+Line 209-210: Converts all selected columns to numeric values (`pd.to_numeric`).
+Line 213-214: Determines temporal span:
+              `start_ts = work_df[ts_col].min().floor("h")` -> Snaps first reading down to the nearest hour.
+              `end_ts = work_df[ts_col].max().ceil("h")`   -> Snaps last reading up to the nearest hour.
+Line 217-218: `grid_continuous = pd.date_range(start=start_ts, end=end_ts, freq="1h", name="timestamp")`
+              Creates an exact, unbroken chronological timeline with step size = 1 hour (8,760 rows for a year).
+Line 221-226: `hourly_df = work_df.set_index(ts_col)[cols_to_process].resample("1h").mean()`
+              Aggregates raw telemetry to hourly means. Handles second-level drift (e.g. 00:00:31) or sub-hourly logs (15-min).
+Line 229:     `reindexed_df = hourly_df.reindex(grid_continuous)`
+              Forces the DataFrame to match the strict hourly grid. Any missing hours automatically become `NaN`.
+Line 232-236: Computes missing count in raw data: `raw_missing_mask = reindexed_df[val_col].isna()`.
+              Calls `calculate_max_continuous_consecutive()` to record the largest raw data blackout.
+Line 239-248: Bounded Linear Interpolation:
+              Loops over each channel in `cols_to_process` and applies `.interpolate(method="linear", limit=3, limit_direction="both")`.
+              Creates cleaned channels stored as `f"{col}_clean"` (e.g. `watts_total_clean`).
+              *Note: Minor gaps <= 3h are smoothed; large gaps > 3h remain NaN to avoid faking plant downtime.*
+Line 250-254: Calculates post-interpolation missing metrics and how many hours were recovered by interpolation.
+Line 256-257: Calculates `raw_completeness_pct` and `final_completeness_pct` (e.g., 99.82% -> 100.0%).
+Line 260-262: Outage detection on cleaned metric:
+              `outage_mask = (reindexed_df[f"{val_col}_clean"] <= self.outage_threshold_kw) & (~post_interp_missing_mask)`
+              Finds hours where power was zero but data was NOT missing.
+Line 265-288: Builds the `summary` audit dictionary returning:
+              - Start and end timestamps
+              - Detected timestamp and primary metric names
+              - Lists of all numeric and categorical columns
+              - Total expected grid hours, recorded hours, and missing hours
+              - Raw and final completeness percentages
+              - Total outage hours and max continuous outage duration
+              - Peak, average, and minimum metric values
+Line 290:     Returns `(reindexed_df, summary)`.
+
+How cleaning.py Relates to Others:
+- Output `reindexed_df` (referred to as `clean_df`) is passed to `detector.py`, `reporter.py`, and `app.py`.
+- Output `summary` dictionary feeds the metric cards on the Streamlit dashboard and executive PDF header.
+
+================================================================================
+4. FILE 3: src/detector.py (INDUSTRIAL EVENT DETECTION ENGINE)
+================================================================================
+Purpose: Scans the cleaned telemetry stream to identify, group, and rank electrical anomalies.
+
+Lists: Candidate Lists (POWER_CANDIDATES, VOLTAGE_CANDIDATES, PF_CANDIDATES, THD_CANDIDATES)
+- Lines 18-30: Ordered priority rankings for electrical channel matching.
+  `POWER_CANDIDATES` starts with `["watts_total_clean", "watts_total", "load_kw_clean", ...]`.
+  Ensures real telemetry channels win over synthetic names while preserving backward compatibility.
+
+Function 1: resolve_channel(df, preferred_col=None, candidate_list=None, fallback_contains=None) -> Optional[str]
+-----------------------------------------------------------------------------------------------------------------
+Goal: Finds the best matching column name in `df`.
+Line 42-44: If `preferred_col` is given and exists in `df`, returns it.
+Line 46:    Builds a case-insensitive lookup dictionary `lower_map = {lower_str: original_str}`.
+Line 49-54: Loops through candidate list; if candidate exists in `lower_map`, returns original column name.
+Line 56-61: Substring search: if a column contains keyword (e.g., "volt", "pf", "thd"), returns it.
+Line 62:    Returns `None` if no matching channel exists in the dataset.
+
+Function 2: calculate_severity(event_type: str, duration_hours: int, metrics: Dict) -> str
+-------------------------------------------------------------------------------------------
+Goal: Assigns a standardized severity ("Critical", "High", "Medium", "Low") based on electrical engineering rules.
+Line 74-80: Outage Severity:
+            Duration >= 6h -> "Critical" (prolonged blackout)
+            Duration >= 2h -> "High"
+            Duration < 2h  -> "Medium" (short breaker trip)
+Line 82-89: Load Trip Severity (>40% drop in 1 hour):
+            Max drop >= 75% or duration >= 3h -> "Critical" (severe plant failure)
+            Max drop >= 55% or duration >= 2h -> "High"
+            Otherwise                         -> "Medium"
+Line 91-100: Poor Power Factor (PF < 0.85):
+            Min PF < 0.65 or duration >= 8h -> "Critical" (extreme reactive energy penalty)
+            Min PF < 0.75 or duration >= 4h -> "High"
+            Min PF < 0.80 or duration >= 2h -> "Medium"
+            Otherwise                       -> "Low"
+Line 102-111: High Harmonics (THD > 5% IEEE 519 standard):
+            Max THD > 12% or duration >= 12h -> "Critical" (risk of transformer overheating/fire)
+            Max THD > 8% or duration >= 6h   -> "High"
+            Max THD > 6% or duration >= 3h   -> "Medium"
+            Otherwise                        -> "Low"
+
+Function 3: group_consecutive_hourly_events(condition_mask, timestamps, values, event_type, additional_series=None) -> List[Dict]
+---------------------------------------------------------------------------------------------------------------------------------
+Goal: Groups continuous runs of hourly violations into discrete events with start time, end time, and metrics.
+
+Line-by-Line Breakdown:
+Line 125-126: If no violation exists, returns empty list `[]`.
+Line 129:     `group_ids = (~condition_mask).cumsum()[condition_mask]`
+              Assigns a unique integer ID to each contiguous block of `True` hours.
+Line 131:     `for _, group_indices in group_ids.groupby(group_ids).groups.items():`
+              Iterates through each distinct violation event.
+Line 132-137: Extracts event start timestamp (`sub_ts.iloc[0]`), end timestamp (`sub_ts.iloc[-1]`),
+              and duration in hours (`len(group_indices)`).
+Line 139-144: Computes statistical metrics across the event: mean value, min value, and max value.
+Line 146-156: Captures event-specific attributes:
+              - For Outages: records `max_outage_load`.
+              - For Trips: records `max_drop_pct`.
+              - For Poor PF: records `min_pf`.
+              - For High THD: records `max_thd_pct`.
+Line 158-163: If secondary channels (voltage, pre-trip load) were passed in `additional_series`, records their means.
+Line 164:     Calls `calculate_severity()` to determine event severity.
+Line 166-173: Appends a structured dictionary containing `start_time`, `end_time`, `duration_hours`,
+              `event_type`, `severity`, and `details`.
+
+Function 4: detect_industrial_events(df, power_col=None, voltage_col=None, pf_col=None, thd_col=None, ...) -> pd.DataFrame
+---------------------------------------------------------------------------------------------------------------------------
+Goal: Main event detection orchestrator. Scans for all 4 industrial event types and returns a sorted DataFrame.
+
+Line-by-Line Breakdown:
+Line 201-204: Returns empty DataFrame with predefined schema if `df` is empty.
+Line 208-216: Extracts timestamps from DatetimeIndex or from a column named "timestamp".
+Line 218-225: Resolves actual column names for power (`p_col`), voltage (`v_col`), power factor (`pf_channel`),
+              and harmonics (`thd_channel`) using `resolve_channel()`.
+
+Section 1: Outages (Lines 231-256)
+- Evaluates `power_series <= power_threshold_zero` (default 50 Watts / 0.05 kW).
+- If voltage channel exists, records voltage during the outage.
+- Note: Evaluates plant power outage whenever power is zero, preserving voltage in event details so
+  engineers can see if the utility grid was alive (plant trip) or dead (utility blackout).
+- Passes mask to `group_consecutive_hourly_events()` and appends results.
+
+Section 2: Load Trips / Drops (Lines 261-281)
+- Calculates hourly change: `prev_power = power_series.shift(1)`.
+- Calculates percentage drop: `pct_drop = ((prev_power - power_series) / prev_power) * 100`.
+- Flags trip if `significant_previous` (equipment was running) AND `pct_drop >= 40%`.
+- Passes mask to `group_consecutive_hourly_events()` and appends results.
+
+Section 3: Poor Power Factor (Lines 286-303)
+- Takes absolute value `pf_series = df[pf_channel].abs()` (standard practice for lagging/leading PF).
+- Evaluates condition only when equipment is running: `active_load_running & (pf_series < 0.85) & (pf_series > 0.0)`.
+- Passes mask to `group_consecutive_hourly_events()` and appends results.
+
+Section 4: High Harmonics THD (Lines 308-318)
+- Flags hours where `thd_series > 5.0%`.
+- Passes mask to `group_consecutive_hourly_events()` and appends results.
+
+Line 325-328: Combines all events into a single pandas DataFrame, sorts chronologically by `start_time`,
+              resets index, and returns `event_df`.
+
+Class: EnergyAnomalyDetector
+- Lines 331-359: Object-oriented wrapper class that holds default thresholds and exposes a `.detect_events()` method.
+
+How detector.py Relates to Others:
+- Ingests `clean_df` from `cleaning.py`.
+- Outputs `events_df` to `app.py`, which renders the event table, summary KPIs, Plotly alert markers, and CSV export.
+
+================================================================================
+5. FILE 4: src/reporter.py (DAILY/MONTHLY AGGREGATIONS & PDF GENERATION)
+================================================================================
+Purpose: Generates compliance and executive audit artifacts (Daily CSV, Monthly CSV, and ReportLab PDF).
+
+Class: EnergyReporter
+---------------------
+
+Method 1: __init__(self, output_dir=OUTPUTS_DIR)
+- Sets target export directory and creates it on disk via `mkdir(parents=True, exist_ok=True)`.
+
+Method 2: generate_daily_summary(df: pd.DataFrame, metric_col: str) -> pd.DataFrame
+Goal: Rolls up hourly telemetry into daily operational KPIs.
+Line 24:    Picks `f"{metric_col}_clean"` if present, otherwise `metric_col`.
+Line 25-30: Calls `df.resample("1D").agg(...)`:
+            - `peak_power`: `max` value of the day.
+            - `avg_power`: `mean` value of the day.
+            - `min_power`: `min` value of the day.
+            - `total_energy_wh`: `lambda s: s.sum() * 1.0` -> Integrates hourly power over time
+              (Power in Watts * 1 hour = Watt-hours).
+Line 31-34: Rounds all metrics to 2 decimal places.
+Line 35:    Returns `daily_df`.
+
+Method 3: generate_monthly_summary(df: pd.DataFrame, metric_col: str) -> pd.DataFrame
+Goal: Rolls up hourly telemetry into monthly energy billings.
+Line 40:    Resolves cleaned metric column.
+Line 41-46: Calls `df.resample("1ME").agg(...)` (`1ME` = 1 Month End frequency in modern pandas):
+            - `peak_power`: Monthly maximum peak demand.
+            - `avg_power`: Monthly average operating load.
+            - `min_power`: Monthly minimum load.
+            - `total_energy_wh`: Monthly sum of energy consumption in Wh.
+Line 47-50: Rounds values to 2 decimal places.
+Line 51:    Returns `monthly_df`.
+
+Method 4: generate_monthly_pdf_report(summary_dict, monthly_df, metric_col) -> bytes
+Goal: Creates an executive PDF report in memory without writing temporary scratch files to disk.
+Line 60:    `buffer = io.BytesIO()`: Creates an in-memory byte buffer.
+Line 61-62: `c = canvas.Canvas(buffer, pagesize=letter)`: Initializes a ReportLab PDF canvas using letter page size.
+Line 64-70: Draws Title, subtitle with metric name and date span, and a horizontal divider line.
+Line 72-85: Draws High-Level Facility KPIs:
+            - Peak Telemetry value
+            - Average Telemetry value
+            - Total Grid Hours (8,760 h)
+            - Final Completeness Percentage (e.g. 100.00%)
+            - Total Outage Hours
+Line 87-101: Draws the Monthly Table Header: Columns for "Month", "Peak Value", "Avg Value", "Min Value", "Total Wh".
+Line 103-116: Loops over rows in `monthly_df`:
+              - Checks page height (`if y < 60: c.showPage()`); starts a new page if table runs out of space.
+              - Formats month (`YYYY-MM`) and prints formatted numeric strings (`{val:,.1f}`).
+              - Decrements `y -= 16` for the next table row.
+Line 117-120: `c.showPage(); c.save()`: Finalizes the PDF layout.
+              `buffer.seek(0)`: Resets stream pointer to the start.
+              `return buffer.getvalue()`: Returns raw PDF bytes for Streamlit download button.
+
+How reporter.py Relates to Others:
+- Uses `clean_df` from `cleaning.py` and `summary` metadata.
+- Invoked inside `ui/app.py` under the "📑 Report Generation" tab.
+
+================================================================================
+6. FILE 5: ui/app.py (STREAMLIT INTERACTIVE WEB APPLICATION)
+================================================================================
+Purpose: Coordinates the entire application, presenting an offline reactive UI for plant engineers.
+
+Line-by-Line Architecture Walkthrough:
+--------------------------------------
+Lines 1-18: Imports dependencies (Streamlit, Plotly, Pandas, NumPy, and local modules).
+            `sys.path.append(...)` ensures `src` is discoverable regardless of working directory.
+Lines 20-25: `st.set_page_config()`: Configures browser tab title ("Industrial Energy Monitor"),
+             favicon ("⚡"), wide layout, and expanded sidebar.
+Lines 27-28: Header title and caption explaining offline capabilities.
+Lines 30-40: Session State Initialization:
+             Pre-allocates keys in `st.session_state`: `clean_df`, `audit_summary`, `events_df`,
+             `active_filename`, and `raw_df`. This prevents unnecessary reprocessing on tab clicks.
+
+Sidebar Configuration (Lines 42-86):
+- `st.sidebar.file_uploader()`: Allows users to upload `.xlsx`, `.xls`, `.xlsm`, or `.csv` files.
+- Sample Dataset Selector: If no file is uploaded, scans `data/` and provides a dropdown to load
+  sample datasets (like `ESP_Demo_Data_1Year.xlsx`).
+- Lines 60-67: If no dataset is active, stops execution and prompts user to upload a file.
+- Lines 68-85: Loads raw file via `processor.load_excel()` and caches in `st.session_state["raw_df"]`.
+
+Dynamic Column Mapping in Sidebar (Lines 87-158):
+- Line 89: Calls `col_inventory = get_column_inventory(raw_df)`.
+- Lines 97-114: Builds smart shortlist for Timestamp column (filtering for names containing "ts", "time", "date").
+- Lines 116-130: Builds primary load shortlist (matching "watt", "power", "load", "kw", while excluding
+  cumulative registers like "wh_", "vah_", "received", "delivered"). Pre-selects `watts_total`.
+  Provides a checkbox to expose all 90 numeric channels if desired.
+- Lines 132-153: Auto-detects diagnostic channels (`vll_avg` for Voltage, `true_pf_avg` for PF,
+  `v_R_thd_pct` for THD), allowing manual overrides via dropdowns.
+- Lines 154-157: Automatically includes detected diagnostic channels in `extra_channels_to_aggregate`
+  so they are cleaned in parallel.
+
+Detection Thresholds & Reindexing Execution (Lines 159-196):
+- Sliders for Max Gap Interpolation (1-12h), Outage Power Threshold (in Watts),
+  Load Trip drop threshold (20-90%), Poor PF threshold (0.50-0.95), and High THD threshold (2-15%).
+- Line 169: Instantiates `EnergyDataProcessor(max_interp_gap=max_gap_interp, outage_threshold_kw=outage_threshold_kw)`.
+- Line 172-175: Runs `processor.process_and_reindex_grid()`, producing `clean_df` and `summary`.
+- Line 177-180: `_clean()` helper function resolves cleaned column names.
+- Line 182-192: Runs `detect_industrial_events()`, producing `events_df`.
+- Line 194-196: Stores `clean_df`, `summary`, and `events_df` in `st.session_state`.
+
+Multi-Tab Layout (Lines 198-205):
+Creates 5 main tabs:
+  1. "📊 Load Overview"
+  2. "⚠️ Anomaly & Event Detection"
+  3. "📈 24h Load Forecasting"
+  4. "🤖 Local Ollama Assistant"
+  5. "📑 Report Generation"
+
+Tab 1: Load Overview (Lines 211-295):
+- Lines 216-221: 5 Top Metric Cards:
+  - Metric 1: Timeline Span (e.g. 8,760h, 2025-01-01 to 2025-12-31)
+  - Metric 2: Raw Completeness (e.g. 99.82%, 16h missing)
+  - Metric 3: Final Completeness (e.g. 100.0%, +16h recovered)
+  - Metric 4: Total Events Flagged (e.g. 62 total, 54 Critical/High)
+  - Metric 5: Peak Telemetry (e.g. 14,900,000.0 W, Avg: 10,245,780.0 W)
+- Lines 226-244: Expandable accordion showing complete dataset inventory breakdown.
+- Lines 246-292: Plotly Interactive Chart:
+  - Blue line: Cleaned load profile over time.
+  - Green dots: Raw recorded points (reveals where interpolation smoothed gaps).
+  - Red triangle-up markers: Exact timestamps where Critical/High events occurred.
+
+Tab 2: Anomaly & Event Detection (Lines 297-367):
+- Lines 301-306: Category KPI Cards: Outages, Load Trips, Poor PF, High THD counts.
+- Lines 312-330: Multi-select interactive filter for Event Types and Severity levels.
+- Lines 332-340: Color-coded severity styling function:
+  - Critical = Red badge
+  - High = Orange badge
+  - Medium = Yellow badge
+  - Low = Blue badge
+- Lines 342-353: Interactive table displaying `start_time`, `end_time`, `duration_hours`,
+  `event_type`, `severity`, and formatted electrical event details.
+- Lines 356-363: Download Event Log CSV button.
+
+Tab 3: 24h Load Forecasting (Lines 369-374):
+- Placeholder displaying pipeline readiness for statistical/machine learning models (ARIMA / Ridge / Random Forest).
+
+Tab 4: Local Ollama Assistant (Lines 376-386):
+- Connects to local offline Ollama LLM to answer facility energy queries using `summary` as grounding context.
+
+Tab 5: Report Generation (Lines 387-448):
+- Line 391-392: Generates Daily and Monthly DataFrames via `EnergyReporter`.
+- Column 1: "📅 Daily Summary" -> Download Daily Summary CSV button.
+- Column 2: "📊 Monthly Summary" -> Download Monthly Summary CSV and Download Monthly Summary PDF buttons.
+- Column 3: "⚠️ Industrial Events" -> Download Detected Industrial Events CSV button.
+
+================================================================================
+7. END-TO-END DATA LIFECYCLE (TRACE OF 1 SAMPLE ROW)
+================================================================================
+To see how all files collaborate, let us trace a single telemetry reading:
+
+1. In `ESP_Demo_Data_1Year.xlsx`:
+   Row 483: `ts = 2025-01-21 03:00:06`, `watts_total = 0.0`, `vll_avg = 139004.8 V`.
+
+2. In `src/cleaning.py`:
+   - `get_column_inventory()` recognizes `ts` as datetime, `watts_total` as active power,
+     and `vll_avg` as line voltage.
+   - `process_and_reindex_grid()` floors the timestamp: `2025-01-21 03:00:00`.
+   - The row is indexed on the 8,760-hour calendar grid.
+   - Because `watts_total` is 0.0, it is not missing; it is preserved as `0.0` in `watts_total_clean`.
+
+3. In `src/detector.py`:
+   - `detect_industrial_events()` receives the cleaned row.
+   - Checks power: `0.0 <= 50.0 W` -> Outage condition is TRUE.
+   - Checks previous hour: `prev_power = 12,000,000 W`, drop = 100% -> Load Trip condition is TRUE.
+   - `group_consecutive_hourly_events()` calculates duration = 1 hour.
+   - `calculate_severity()` rates the 100% drop as "Critical" and the 1-hour shutdown as "Medium".
+   - Appends two event records to `events_df`.
+
+4. In `src/reporter.py`:
+   - `generate_daily_summary()` aggregates January 21: records `min_power = 0.0 W`.
+   - `generate_monthly_summary()` rolls this into January 2025 totals.
+   - `generate_monthly_pdf_report()` draws January's row into the PDF report table.
+
+5. In `ui/app.py`:
+   - The Plotly chart draws the load curve dropping to 0 at `2025-01-21 03:00:00` with a red alert triangle.
+   - The Anomaly tab lists the Critical Trip and Medium Outage with exact start/end times.
+   - The Reports tab offers immediate download of the daily CSV, monthly CSV, and audit PDF.
+================================================================================
+[ End of Line-by-Line Architecture & Code Document ]
