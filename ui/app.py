@@ -17,6 +17,7 @@ from src.cleaning import EnergyDataProcessor, get_column_inventory
 from src.detector import detect_industrial_events, resolve_channel, POWER_CANDIDATES, VOLTAGE_CANDIDATES, PF_CANDIDATES, THD_CANDIDATES
 from src.reporter import EnergyReporter
 from src.rag_agent import ask_energy_agent, explain_detected_event, check_ollama_status
+from src.forecaster import LoadForecaster
 
 st.set_page_config(
     page_title="Industrial Energy Monitor",
@@ -369,10 +370,101 @@ with tab_anomalies:
 
 with tab_forecast:
     st.subheader("📈 24-Hour Predictive Load Demand")
-    if clean_df is not None:
-        st.write("24-hour predictive pipeline ready for training on the cleaned continuous grid.")
+    if clean_df is not None and summary is not None:
+        metric_col = summary["selected_metric_column"]
+        clean_col = f"{metric_col}_clean" if f"{metric_col}_clean" in clean_df.columns else metric_col
+
+        st.caption(f"Predicting next 24 hours of load trajectory for `{metric_col}` using cyclical hour/day feature engineering and machine learning.")
+
+        f_control1, f_control2, f_control3 = st.columns([1, 1, 1])
+        with f_control1:
+            model_choice = st.selectbox("Model Architecture", options=["Ridge Regression", "Random Forest Regressor"], index=0)
+        with f_control2:
+            model_key = "ridge" if model_choice == "Ridge Regression" else "rf"
+            run_forecast_btn = st.button("🚀 Generate 24-Hour Forecast", type="primary")
+        with f_control3:
+            st.caption("Includes 24-hour holdout validation (MAE, RMSE, MAPE).")
+
+        # Session state cache for forecast results
+        forecast_cache_key = f"fc_{metric_col}_{model_key}"
+        if run_forecast_btn or (forecast_cache_key in st.session_state):
+            if run_forecast_btn:
+                with st.spinner(f"Training {model_choice} and extrapolating future 24-hour demand..."):
+                    forecaster = LoadForecaster(horizon_hours=24, model_type=model_key)
+                    fc_df, recent_df, fc_metrics = forecaster.fit_and_predict_next_24h(clean_df[clean_col], target_name=metric_col)
+                    st.session_state[forecast_cache_key] = (fc_df, recent_df, fc_metrics)
+            
+            fc_df, recent_df, fc_metrics = st.session_state[forecast_cache_key]
+
+            # 1. Performance Metric Cards
+            m1, m2, m3, m4, m5 = st.columns(5)
+            m1.metric("Predicted Peak", f"{fc_metrics['forecast_peak_mw']:.2f} MW", f"{fc_metrics['forecast_peak_time'][-8:]}")
+            m2.metric("Predicted Average", f"{fc_metrics['forecast_avg_mw']:.2f} MW")
+            m3.metric("Backtest MAPE", f"{fc_metrics['mape_pct']:.2f}%", "Validation Error")
+            m4.metric("Backtest MAE", f"{fc_metrics['mae_mw']:.3f} MW", f"{fc_metrics['mae']:,.0f} W")
+            m5.metric("Backtest RMSE", f"{fc_metrics['rmse_mw']:.3f} MW")
+
+            st.divider()
+
+            # 2. Interactive Forecast Plotly Chart
+            fig_fc = go.Figure()
+
+            # Recent actual load (last 48-72h)
+            fig_fc.add_trace(go.Scatter(
+                x=recent_df.index,
+                y=recent_df["actual_load_mw"],
+                mode="lines",
+                name="Recent Actual Load (MW)",
+                line=dict(color="#1f77b4", width=2)
+            ))
+
+            # Future 24-hour forecast
+            fig_fc.add_trace(go.Scatter(
+                x=fc_df.index,
+                y=fc_df["predicted_load_mw"],
+                mode="lines+markers",
+                name="Predicted Next 24h (MW)",
+                line=dict(color="#ff7f0e", width=2.5, dash="dash"),
+                marker=dict(size=5, color="#ff7f0e")
+            ))
+
+            # Vertical separator line indicating forecast horizon start
+            fig_fc.add_vline(
+                x=pd.to_datetime(fc_metrics["last_historical_timestamp"]),
+                line_width=1.5,
+                line_dash="dot",
+                line_color="#7f7f7f",
+                annotation_text="Forecast Start",
+                annotation_position="top left"
+            )
+
+            fig_fc.update_layout(
+                title=f"24-Hour Load Demand Forecast — {metric_col} ({fc_metrics['model_type']})",
+                xaxis_title="Timeline",
+                yaxis_title="Load Demand (MW)",
+                template="plotly_white",
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
+                height=450
+            )
+            st.plotly_chart(fig_fc, use_container_width=True)
+
+            # 3. Forecast Table & CSV Export
+            st.markdown("#### 📋 Hourly Forecast Schedule")
+            table_col1 = st.columns(2)
+
+            with table_col1[0]:
+                display_fc = fc_df.reset_index()
+                display_fc["timestamp"] = display_fc["timestamp"].dt.strftime("%Y-%m-%d %H:%M")
+                display_fc.rename(columns={
+                    "timestamp": "Target Hour",
+                    "predicted_load": f"Predicted Load ({metric_col})",
+                    "predicted_load_mw": "Predicted Load (MW)"
+                }, inplace=True)
+                st.dataframe(display_fc, use_container_width=True, height=280)
+
     else:
-        st.info("Upload energy telemetry to enable predictive forecasting.")
+        st.info("Upload energy telemetry to enable predictive load forecasting.")
 
 with tab_rag:
     st.subheader("🤖 Local LLM Energy Advisor (Ollama — llama3.2:3b)")
