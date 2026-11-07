@@ -1,19 +1,13 @@
 """PDF and CSV export utilities for industrial energy reports."""
-from pathlib import Path
 from typing import Dict, Any, Union, Optional
 import io
 import pandas as pd
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
-from src.config import OUTPUTS_DIR
 
 
 class EnergyReporter:
     """Exports structured energy reports: Daily/Monthly summaries and PDF audit reports."""
-
-    def __init__(self, output_dir: Union[str, Path] = OUTPUTS_DIR):
-        self.output_dir = Path(output_dir)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def generate_daily_summary(df: pd.DataFrame, metric_col: str) -> pd.DataFrame:

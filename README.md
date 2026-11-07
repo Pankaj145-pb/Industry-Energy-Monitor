@@ -55,18 +55,17 @@ Scans multiple correlated electrical channels simultaneously and groups contiguo
 
 The system utilizes two distinct types of local, offline models:
 
-### A. 24-Hour Predictive Load Demand Models (`src/forecaster.py`)
-Predicts the next 24 hours of facility power demand ($P_{t+1} \dots P_{t+24}$) to help engineers anticipate peak demand overshoots and plan generator dispatch.
+### A. 24-Hour Predictive Load Demand Model (`src/forecaster.py`)
+Predicts the next 24 hours of facility power demand ($P_{t+1} \dots P_{t+24}$) using a dedicated **Random Forest Regressor** to help engineers anticipate peak demand overshoots and plan generator dispatch.
 - **Feature Engineering**:
   - *Cyclical Time Features*: Sine and cosine encoding for hour-of-day ($24\text{h}$ period), day-of-week ($7\text{d}$), and month ($12\text{m}$) to preserve periodic continuity ($23:00 \rightarrow 00:00$).
   - *Autoregressive Lags*: $t-1, t-2, t-3$, same-hour yesterday ($t-24$), day-before-yesterday ($t-48$), and same-hour last week ($t-168$).
   - *Rolling Statistics*: Rolling means and standard deviations over 6-hour and 24-hour windows.
-- **Model Architectures Available**:
-  - **Ridge Regression** (Default): Fast, L2-regularized linear baseline ($\alpha=100$) offering high stability and explainability.
-  - **Random Forest Regressor**: Non-linear tree ensemble capturing complex equipment interactions.
+- **Model Architecture**:
+  - **Random Forest Regressor**: Multi-tree ensemble (`n_estimators=100`, `max_depth=12`, parallelized with `n_jobs=-1`) capturing complex non-linear equipment interactions, shift changes, and thermal kiln cycles.
 - **Holdout Validation & Backtesting**:
   - Evaluates performance on an unseen 24-hour holdout window before forecasting.
-  - Achieves **$2.74\%$ MAPE** (Mean Absolute Percentage Error, $\approx 97.26\%$ accuracy), **$0.303\text{ MW}$ MAE**, and **$0.384\text{ MW}$ RMSE** on the 2025 cement plant feeder.
+  - Generates industry-standard evaluation metrics: **MAPE** (Mean Absolute Percentage Error), **MAE** (Mean Absolute Error in MW and Watts), and **RMSE** (Root Mean Squared Error).
 
 ### B. Local Offline LLM Agent (`src/rag_agent.py`)
 - **Model**: **`llama3.2:3b`** running on a local Ollama daemon (`http://localhost:11434`).
@@ -80,14 +79,12 @@ Predicts the next 24 hours of facility power demand ($P_{t+1} \dots P_{t+24}$) t
 
 ```text
 Assignment/
-├── .gitignore               # Ignores .venv/, data/, models/, outputs/
+├── .gitignore               # Ignores .venv/, data/
 ├── requirements.txt         # Project dependencies (pandas, streamlit, plotly, scikit-learn, reportlab, ollama)
 ├── README.md                # Project documentation and architecture guide
 ├── setup.ps1                # Automated PowerShell environment setup script
 ├── data/                    # Private telemetry files (Excel / CSV) - Git-ignored
 │   └── ESP_Demo_Data_1Year.xlsx  # 1-year 101-channel hourly industrial feeder data
-├── models/                  # Local model cache - Git-ignored
-├── outputs/                 # Exported audit PDFs and CSV summaries - Git-ignored
 ├── src/                     # Core analytical backend
 │   ├── __init__.py
 │   ├── config.py            # Centralized constants, paths, and thresholds
@@ -160,7 +157,7 @@ The application will open in your browser at `http://localhost:8501`.
 ## 🖥️ Features & Dashboard Capabilities
 
 1. **📊 Load Overview Tab**:
-   - Ingests Excel (`.xlsx`, `.xls`, `.xlsm`) or `.csv` files.
+   - Ingests Excel (`.xlsx`, `.xls`, `.xlsm`) or `.csv` files (uploaded files are automatically saved to the local `data/` directory).
    - Dynamic channel selector for primary metric (e.g. `watts_total`) and timestamp column.
    - Top KPI cards: Timeline span, raw completeness %, final completeness %, total events flagged, peak and average telemetry.
    - Interactive Plotly chart with raw recorded points, cleaned trace, and red triangle markers for Critical/High events.
@@ -170,7 +167,7 @@ The application will open in your browser at `http://localhost:8501`.
    - Structured tabular event log with duration, severity tags, and details.
    - Dedicated `📥 Download Event Log CSV` export.
 3. **📈 24h Load Forecasting Tab**:
-   - Switch between Ridge Regression and Random Forest.
+   - Trains a Random Forest Regressor on historical load curves.
    - Visualizes recent actual load alongside the future 24-hour predicted trajectory.
    - Backtest validation metrics: Predicted Peak, Predicted Average, MAPE (%), MAE, and RMSE.
    - Hourly 24-hour prediction schedule table with `📥 Download 24h Forecast CSV`.

@@ -6,8 +6,6 @@ env/
 
 # Data files & local caches
 data/
-models/
-outputs/
 
 # Python bytecode & cache
 __pycache__/

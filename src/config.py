@@ -4,14 +4,11 @@ from pathlib import Path
 # Base directories
 BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
-MODELS_DIR = BASE_DIR / "models"
-OUTPUTS_DIR = BASE_DIR / "outputs"
 SRC_DIR = BASE_DIR / "src"
 UI_DIR = BASE_DIR / "ui"
 
-# Ensure directories exist
-for directory in [DATA_DIR, MODELS_DIR, OUTPUTS_DIR]:
-    directory.mkdir(parents=True, exist_ok=True)
+# Ensure data directory exists
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # Ollama / Local LLM settings
 OLLAMA_BASE_URL = "http://localhost:11434"

@@ -12,7 +12,7 @@ import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 
-from src.config import OUTPUTS_DIR, DATA_DIR, OUTAGE_THRESHOLD_KW
+from src.config import DATA_DIR, OUTAGE_THRESHOLD_KW
 from src.cleaning import EnergyDataProcessor, get_column_inventory
 from src.detector import detect_industrial_events, resolve_channel, POWER_CANDIDATES, VOLTAGE_CANDIDATES, PF_CANDIDATES, THD_CANDIDATES
 from src.reporter import EnergyReporter
@@ -50,6 +50,20 @@ uploaded_file = st.sidebar.file_uploader(
     help="Upload private factory submeter or feeder logs."
 )
 
+if uploaded_file is not None:
+    save_path = DATA_DIR / uploaded_file.name
+    saved_key = f"saved_{uploaded_file.name}_{uploaded_file.size}"
+    if not st.session_state.get(saved_key, False) or not save_path.exists():
+        try:
+            with open(save_path, "wb") as f:
+                f.write(uploaded_file.getbuffer())
+            st.session_state[saved_key] = True
+            st.sidebar.success(f"💾 Saved to `data/{uploaded_file.name}`")
+        except Exception as e:
+            st.sidebar.warning(f"Could not save copy to data folder: {e}")
+    else:
+        st.sidebar.caption(f"💾 Saved in `data/{uploaded_file.name}`")
+
 # Optional quick-load from data/ folder if no file is uploaded yet
 sample_files = list(DATA_DIR.glob("*.xlsx")) + list(DATA_DIR.glob("*.csv"))
 selected_sample = None
@@ -61,12 +75,6 @@ if not uploaded_file and sample_files:
 
 # Load raw dataframe once to inspect all columns
 active_source = uploaded_file or selected_sample
-if active_source is None:
-    for k in ["clean_df", "audit_summary", "events_df", "raw_df", "active_filename"]:
-        if k in st.session_state:
-            st.session_state[k] = None
-    st.info("👆 Upload a file or pick a sample dataset to begin.")
-    st.stop()
 raw_df = None
 
 if active_source is not None:
@@ -75,6 +83,7 @@ if active_source is not None:
     if st.session_state.get("active_filename") != source_name or st.session_state.get("raw_df") is None:
         processor = EnergyDataProcessor()
         if hasattr(active_source, "read"):
+            active_source.seek(0)
             if source_name.endswith(".csv"):
                 raw_df = pd.read_csv(active_source)
             else:
@@ -96,11 +105,18 @@ if raw_df is not None:
     all_cols = col_inventory["all_columns"]
     numeric_cols = col_inventory["numeric_columns"] if col_inventory["numeric_columns"] else all_cols
 
-    # --- Timestamp shortlist (not all 101) ---
+    # --- Timestamp shortlist ---
     ts_candidates = []
     for c in all_cols:
+        # Native datetime columns
+        if pd.api.types.is_datetime64_any_dtype(raw_df[c]):
+            ts_candidates.append(c)
+            continue
+        # Skip purely numeric channels (watts, volts, etc. are not timestamps)
+        if pd.api.types.is_numeric_dtype(raw_df[c]):
+            continue
         name = str(c).strip().lower()
-        if name in ("ts", "time", "date", "datetime", "timestamp") or "time" in name or "date" in name:
+        if any(k in name for k in ["ts", "time", "date", "datetime", "timestamp"]):
             ts_candidates.append(c)
             continue
         try:
@@ -128,33 +144,15 @@ if raw_df is not None:
     elif col_inventory["primary_metric_column"] in load_candidates:
         load_candidates = [col_inventory["primary_metric_column"]] + [c for c in load_candidates if c != col_inventory["primary_metric_column"]]
     selected_metric_col = st.sidebar.selectbox("Primary Load / Active Power", options=load_candidates, index=0)
-    if st.sidebar.checkbox("Show all numeric columns for primary", value=False):
-        selected_metric_col = st.sidebar.selectbox("Primary Load (full list)", options=numeric_cols, index=numeric_cols.index(selected_metric_col) if selected_metric_col in numeric_cols else 0)
 
-    # --- Auto-detect voltage / PF / THD ---
+    # --- Auto-detect voltage / PF / THD for background event detection ---
     detected_v = resolve_channel(raw_df, None, VOLTAGE_CANDIDATES, fallback_contains="volt") or \
                  resolve_channel(raw_df, None, None, fallback_contains="vll")
     detected_pf = resolve_channel(raw_df, None, PF_CANDIDATES, fallback_contains="pf")
     detected_thd = resolve_channel(raw_df, None, THD_CANDIDATES, fallback_contains="thd")
 
-    with st.sidebar.expander("⚡ Electrical Diagnostic Channels", expanded=False):
-        v_options = ["(Auto / None)"] + [c for c in numeric_cols if c != selected_metric_col]
-        v_idx = v_options.index(detected_v) if detected_v in v_options else 0
-        selected_voltage_col = st.selectbox("Voltage Channel", options=v_options, index=v_idx, key="v_chan")
-        selected_v = None if selected_voltage_col == "(Auto / None)" else selected_voltage_col
-
-        pf_options = ["(Auto / None)"] + [c for c in numeric_cols if c != selected_metric_col]
-        pf_idx = pf_options.index(detected_pf) if detected_pf in pf_options else 0
-        selected_pf_col = st.selectbox("Power Factor Channel", options=pf_options, index=pf_idx, key="pf_chan")
-        selected_pf = None if selected_pf_col == "(Auto / None)" else selected_pf_col
-
-        thd_options = ["(Auto / None)"] + [c for c in numeric_cols if c != selected_metric_col]
-        thd_idx = thd_options.index(detected_thd) if detected_thd in thd_options else 0
-        selected_thd_col = st.selectbox("Harmonics (THD) Channel", options=thd_options, index=thd_idx, key="thd_chan")
-        selected_thd = None if selected_thd_col == "(Auto / None)" else selected_thd_col
-
     extra_channels_to_aggregate = []
-    for cand in [selected_v or detected_v, selected_pf or detected_pf, selected_thd or detected_thd]:
+    for cand in [detected_v, detected_pf, detected_thd]:
         if cand and cand in raw_df.columns and cand != selected_metric_col and cand not in extra_channels_to_aggregate:
             extra_channels_to_aggregate.append(cand)
 
@@ -184,9 +182,9 @@ if raw_df is not None:
         events_df = detect_industrial_events(
             clean_df,
             power_col=_clean(selected_metric_col),
-            voltage_col=_clean(selected_v or detected_v),
-            pf_col=_clean(selected_pf or detected_pf),
-            thd_col=_clean(selected_thd or detected_thd),
+            voltage_col=_clean(detected_v),
+            pf_col=_clean(detected_pf),
+            thd_col=_clean(detected_thd),
             power_threshold_zero=outage_threshold_w,
             drop_threshold_pct=float(drop_threshold_pct),
             pf_threshold=float(pf_threshold_val),
@@ -369,28 +367,25 @@ with tab_anomalies:
         st.info("Upload energy telemetry to review detected industrial events.")
 
 with tab_forecast:
-    st.subheader("📈 24-Hour Predictive Load Demand")
+    st.subheader("📈 24-Hour Predictive Load Demand (Random Forest)")
     if clean_df is not None and summary is not None:
         metric_col = summary["selected_metric_column"]
         clean_col = f"{metric_col}_clean" if f"{metric_col}_clean" in clean_df.columns else metric_col
 
-        st.caption(f"Predicting next 24 hours of load trajectory for `{metric_col}` using cyclical hour/day feature engineering and machine learning.")
+        st.caption(f"Predicting next 24 hours of load trajectory for `{metric_col}` using Random Forest with cyclical temporal features and autoregressive lags.")
 
-        f_control1, f_control2, f_control3 = st.columns([1, 1, 1])
+        f_control1, f_control2 = st.columns([1, 2])
         with f_control1:
-            model_choice = st.selectbox("Model Architecture", options=["Ridge Regression", "Random Forest Regressor"], index=0)
-        with f_control2:
-            model_key = "ridge" if model_choice == "Ridge Regression" else "rf"
             run_forecast_btn = st.button("🚀 Generate 24-Hour Forecast", type="primary")
-        with f_control3:
-            st.caption("Includes 24-hour holdout validation (MAE, RMSE, MAPE).")
+        with f_control2:
+            st.caption("Evaluates 24-hour holdout validation backtesting (MAE, RMSE, MAPE).")
 
         # Session state cache for forecast results
-        forecast_cache_key = f"fc_{metric_col}_{model_key}"
+        forecast_cache_key = f"fc_{metric_col}_rf"
         if run_forecast_btn or (forecast_cache_key in st.session_state):
             if run_forecast_btn:
-                with st.spinner(f"Training {model_choice} and extrapolating future 24-hour demand..."):
-                    forecaster = LoadForecaster(horizon_hours=24, model_type=model_key)
+                with st.spinner("Training Random Forest Regressor and extrapolating future 24-hour demand..."):
+                    forecaster = LoadForecaster(horizon_hours=24)
                     fc_df, recent_df, fc_metrics = forecaster.fit_and_predict_next_24h(clean_df[clean_col], target_name=metric_col)
                     st.session_state[forecast_cache_key] = (fc_df, recent_df, fc_metrics)
             
@@ -439,7 +434,7 @@ with tab_forecast:
             )
 
             fig_fc.update_layout(
-                title=f"24-Hour Load Demand Forecast — {metric_col} ({fc_metrics['model_type']})",
+                title=f"24-Hour Load Demand Forecast — {metric_col} (Random Forest Regressor)",
                 xaxis_title="Timeline",
                 yaxis_title="Load Demand (MW)",
                 template="plotly_white",

@@ -1,13 +1,12 @@
 """24-Hour Industrial Load Forecasting Engine.
 
 Implements feature engineering (cyclical hour/day transforms, lag features, rolling statistics)
-and training via Ridge Regression / Random Forest to predict the next 24 hours of facility load demand.
+and training via Random Forest Regressor to predict the next 24 hours of facility load demand.
 Includes holdout validation metrics (MAE, RMSE, MAPE) and future 24h trajectory extrapolation.
 """
 from typing import Dict, Any, Tuple, Optional
 import numpy as np
 import pandas as pd
-from sklearn.linear_model import Ridge
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, root_mean_squared_error
 
@@ -49,20 +48,22 @@ def build_forecasting_features(
 
 
 class LoadForecaster:
-    """Trains a multi-step or recursive 24-hour predictive model on historical telemetry."""
+    """Trains a 24-hour predictive model using Random Forest Regressor on historical telemetry."""
 
     def __init__(
         self,
         horizon_hours: int = 24,
-        model_type: str = "ridge"
+        n_estimators: int = 100,
+        max_depth: int = 12,
+        random_state: int = 42
     ):
         self.horizon_hours = horizon_hours
-        self.model_type = model_type.lower()
-        if self.model_type == "rf" or self.model_type == "random_forest":
-            self.model = RandomForestRegressor(n_estimators=100, max_depth=12, random_state=42, n_jobs=-1)
-        else:
-            self.model = Ridge(alpha=100.0)
-
+        self.model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            max_depth=max_depth,
+            random_state=random_state,
+            n_jobs=-1
+        )
         self.feature_cols = []
         self.metrics = {}
         self.last_timestamp = None
@@ -85,15 +86,17 @@ class LoadForecaster:
         x_test = test_set[self.feature_cols]
         y_test = test_set["target"]
 
-        eval_model = Ridge(alpha=100.0) if self.model_type == "ridge" else RandomForestRegressor(
-            n_estimators=60, max_depth=10, random_state=42, n_jobs=-1
+        eval_model = RandomForestRegressor(
+            n_estimators=60,
+            max_depth=10,
+            random_state=42,
+            n_jobs=-1
         )
         eval_model.fit(x_train, y_train)
         preds = eval_model.predict(x_test)
 
         mae = float(mean_absolute_error(y_test, preds))
         rmse = float(root_mean_squared_error(y_test, preds))
-        # Non-zero MAPE calculation
         non_zero = y_test != 0
         if non_zero.any():
             mape = float(np.mean(np.abs((y_test[non_zero] - preds[non_zero]) / y_test[non_zero])) * 100.0)
@@ -142,7 +145,6 @@ class LoadForecaster:
         future_preds = []
 
         for next_ts in future_index:
-            # Construct feature row for next_ts using current history
             temp_series = pd.concat([history, pd.Series([np.nan], index=[next_ts])])
             temp_features = build_forecasting_features(temp_series)
             next_feat_row = temp_features.loc[[next_ts], self.feature_cols]
@@ -151,7 +153,6 @@ class LoadForecaster:
             pred_val = max(0.0, pred_val)  # Power cannot be negative
             future_preds.append(pred_val)
 
-            # Append predicted value into history for the subsequent lag steps
             history.loc[next_ts] = pred_val
 
         # 1. Future Forecast DataFrame
@@ -164,12 +165,12 @@ class LoadForecaster:
         )
         forecast_df.index.name = "timestamp"
 
-        # 2. Backtest Comparison DataFrame (last 72 hours actual + 24 future forecast)
+        # 2. Backtest Comparison DataFrame (last 72 hours actual)
         recent_actuals = series_clean.tail(72).to_frame(name="actual_load")
         recent_actuals["actual_load_mw"] = np.round(recent_actuals["actual_load"] / 1e6, 3)
 
         summary_metrics = {
-            "model_type": self.model_type.upper(),
+            "model_type": "RANDOM FOREST REGRESSOR",
             "mae": self.metrics["mae"],
             "mae_mw": round(self.metrics["mae"] / 1e6, 3),
             "rmse": self.metrics["rmse"],
@@ -188,4 +189,3 @@ class LoadForecaster:
         }
 
         return forecast_df, recent_actuals, summary_metrics
-
