@@ -189,3 +189,133 @@ class LoadForecaster:
         }
 
         return forecast_df, recent_actuals, summary_metrics
+
+    def predict_and_compare_date_profiles(
+        self,
+        series: pd.Series,
+        baseline_date: Any,
+        target_date: Any,
+        growth_rate_pct: float = 0.0,
+        target_name: str = "Active Power"
+    ) -> Tuple[pd.DataFrame, Dict[str, Any]]:
+        """Compares a 24-hour historical baseline day (e.g. Nov 15, 2025)
+
+        with a predicted future 24-hour profile (e.g. Nov 15, 2026),
+        factoring in calendar shifts (day of week) and an optional YoY growth rate.
+        """
+        self.target_name = target_name
+        series_clean = series.dropna().astype(float)
+        if len(series_clean) < 168:
+            raise ValueError("Insufficient history for forecasting (minimum 168 hours / 1 week required).")
+
+        # Ensure model is trained
+        if not self.feature_cols or not hasattr(self.model, "estimators_"):
+            df_feat = build_forecasting_features(series_clean)
+            self.feature_cols = [c for c in df_feat.columns if c != "target"]
+            train_df = df_feat.dropna()
+            self.model.fit(train_df[self.feature_cols], train_df["target"])
+
+        # Normalize baseline and target dates
+        base_dt = pd.to_datetime(baseline_date).date()
+        target_dt = pd.to_datetime(target_date).date()
+
+        base_hours = pd.date_range(start=f"{base_dt} 00:00:00", periods=24, freq="1h")
+        target_hours = pd.date_range(start=f"{target_dt} 00:00:00", periods=24, freq="1h")
+
+        # Extract baseline historical actuals
+        base_series = series_clean.reindex(base_hours).interpolate().bfill().ffill()
+        growth_factor = 1.0 + (growth_rate_pct / 100.0)
+        base_vals = base_series.values * growth_factor
+
+        # Multi-step predictive inference for target day
+        preds = []
+        last_pred = base_vals[-1]
+        last_pred_2 = base_vals[-2]
+        last_pred_3 = base_vals[-3]
+
+        for h in range(24):
+            t_hour = target_hours[h]
+            dow = getattr(t_hour, "day_of_week", getattr(t_hour, "dayofweek", 0))
+
+            feat = {
+                "hour_sin": np.sin(2 * np.pi * t_hour.hour / 24.0),
+                "hour_cos": np.cos(2 * np.pi * t_hour.hour / 24.0),
+                "day_sin": np.sin(2 * np.pi * dow / 7.0),
+                "day_cos": np.cos(2 * np.pi * dow / 7.0),
+                "month_sin": np.sin(2 * np.pi * t_hour.month / 12.0),
+                "month_cos": np.cos(2 * np.pi * t_hour.month / 12.0),
+                "lag_1": last_pred,
+                "lag_2": last_pred_2,
+                "lag_3": last_pred_3,
+                "lag_24": base_vals[h],
+                "lag_48": base_vals[h],
+                "lag_168": base_vals[h],
+                "rolling_mean_6": float(np.mean(preds[-6:] if len(preds) >= 6 else base_vals[:6])),
+                "rolling_std_6": float(np.std(preds[-6:] if len(preds) >= 6 else base_vals[:6])),
+                "rolling_mean_24": float(np.mean(base_vals)),
+                "rolling_std_24": float(np.std(base_vals)),
+            }
+            feat_df = pd.DataFrame([feat])[self.feature_cols]
+            pred_val = float(self.model.predict(feat_df)[0])
+            pred_val = max(0.0, pred_val)
+            preds.append(pred_val)
+
+            last_pred_3 = last_pred_2
+            last_pred_2 = last_pred
+            last_pred = pred_val
+
+        preds = np.array(preds)
+        base_actual_mw = np.round(base_series.values / 1e6, 3)
+        predicted_mw = np.round(preds / 1e6, 3)
+        delta_mw = np.round(predicted_mw - base_actual_mw, 3)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            delta_pct = np.where(base_actual_mw > 0, np.round((delta_mw / base_actual_mw) * 100.0, 1), 0.0)
+
+        hour_labels = [f"{h:02d}:00" for h in range(24)]
+
+        comp_df = pd.DataFrame({
+            "hour": range(24),
+            "hour_label": hour_labels,
+            "baseline_date": str(base_dt),
+            "target_date": str(target_dt),
+            "baseline_load_w": np.round(base_series.values, 2),
+            "baseline_load_mw": base_actual_mw,
+            "predicted_load_w": np.round(preds, 2),
+            "predicted_load_mw": predicted_mw,
+            "delta_mw": delta_mw,
+            "delta_pct": delta_pct
+        })
+
+        base_peak_mw = float(np.max(base_actual_mw))
+        base_peak_hr = hour_labels[int(np.argmax(base_actual_mw))]
+        pred_peak_mw = float(np.max(predicted_mw))
+        pred_peak_hr = hour_labels[int(np.argmax(predicted_mw))]
+
+        base_total_mwh = float(np.sum(base_actual_mw))
+        pred_total_mwh = float(np.sum(predicted_mw))
+
+        peak_delta_mw = round(pred_peak_mw - base_peak_mw, 3)
+        peak_delta_pct = round((peak_delta_mw / base_peak_mw * 100.0), 2) if base_peak_mw > 0 else 0.0
+        energy_delta_mwh = round(pred_total_mwh - base_total_mwh, 3)
+        energy_delta_pct = round((energy_delta_mwh / base_total_mwh * 100.0), 2) if base_total_mwh > 0 else 0.0
+
+        metrics = {
+            "baseline_date": str(base_dt),
+            "target_date": str(target_dt),
+            "growth_rate_pct": float(growth_rate_pct),
+            "baseline_peak_mw": base_peak_mw,
+            "baseline_peak_hour": base_peak_hr,
+            "predicted_peak_mw": pred_peak_mw,
+            "predicted_peak_hour": pred_peak_hr,
+            "peak_delta_mw": peak_delta_mw,
+            "peak_delta_pct": peak_delta_pct,
+            "baseline_avg_mw": round(float(np.mean(base_actual_mw)), 3),
+            "predicted_avg_mw": round(float(np.mean(predicted_mw)), 3),
+            "delta_avg_mw": round(float(np.mean(predicted_mw) - np.mean(base_actual_mw)), 3),
+            "baseline_total_mwh": round(base_total_mwh, 2),
+            "predicted_total_mwh": round(pred_total_mwh, 2),
+            "energy_delta_mwh": energy_delta_mwh,
+            "energy_delta_pct": energy_delta_pct,
+        }
+
+        return comp_df, metrics

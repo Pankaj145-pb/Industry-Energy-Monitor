@@ -168,9 +168,8 @@ The application will open in your browser at `http://localhost:8501`.
    - Dedicated `📥 Download Event Log CSV` export.
 3. **📈 24h Load Forecasting Tab**:
    - Trains a Random Forest Regressor on historical load curves.
-   - Visualizes recent actual load alongside the future 24-hour predicted trajectory.
-   - Backtest validation metrics: Predicted Peak, Predicted Average, MAPE (%), MAE, and RMSE.
-   - Hourly 24-hour prediction schedule table with `📥 Download 24h Forecast CSV`.
+   - **Next 24-Hour Horizon**: Visualizes recent actual load alongside the future 24-hour predicted trajectory with backtest validation (MAPE, MAE, RMSE) and `📥 Download 24h Forecast CSV`.
+   - **Year-over-Year (YoY) 24h Date Comparison**: Select any historical day (e.g. November 15, 2025) and predict future load for the same date 1 year later (e.g. November 15, 2026). Adjust plant growth scenario sliders (-20% to +20%), overlay dual diurnal curves, view hourly delta tables, and export to CSV.
 4. **🤖 Local Ollama Assistant Tab**:
    - Status indicator for local Ollama connection and `llama3.2:3b` availability.
    - Grounded Q&A interface for facility managers.

@@ -458,6 +458,144 @@ with tab_forecast:
                 }, inplace=True)
                 st.dataframe(display_fc, use_container_width=True, height=280)
 
+            with table_col1[1]:
+                st.caption("Export future 24-hour hourly schedule to CSV:")
+                fc_csv = io.StringIO()
+                display_fc.to_csv(fc_csv, index=False)
+                st.download_button(
+                    label="📥 Download 24h Forecast CSV",
+                    data=fc_csv.getvalue(),
+                    file_name=f"24h_load_forecast_{metric_col}.csv",
+                    mime="text/csv",
+                    use_container_width=True
+                )
+
+        # -------------------------------------------------------------
+        # 📅 Year-over-Year (YoY) 24-Hour Date Comparison Tool
+        # -------------------------------------------------------------
+        st.divider()
+        st.subheader("📅 Year-over-Year (YoY) 24-Hour Date Comparison")
+        st.caption("Compare a historical 24-hour day (e.g. November 2025) with a predicted future 24-hour profile (e.g. November 2026), accounting for calendar shifts and production growth.")
+
+        min_d = clean_df.index.min().date()
+        max_d = clean_df.index.max().date()
+
+        # Default baseline date: Nov 15 if present, else max_d
+        cand_base = pd.to_datetime("2025-11-15").date()
+        def_base = cand_base if (min_d <= cand_base <= max_d) else max_d
+        try:
+            def_target = def_base.replace(year=def_base.year + 1)
+        except ValueError:
+            def_target = def_base + pd.Timedelta(days=365)
+
+        yoy_col1, yoy_col2, yoy_col3, yoy_col4 = st.columns([1.2, 1.2, 1.5, 1])
+        with yoy_col1:
+            base_date_input = st.date_input("Historical Baseline Date", value=def_base, min_value=min_d, max_value=max_d)
+        with yoy_col2:
+            target_date_input = st.date_input("Target Prediction Date", value=def_target)
+        with yoy_col3:
+            growth_rate_input = st.slider("YoY Load Growth Scenario (%)", min_value=-20.0, max_value=20.0, value=0.0, step=0.5,
+                                          help="Simulate plant expansion (+%) or energy efficiency gains (-%).")
+        with yoy_col4:
+            st.write("")
+            st.write("")
+            run_yoy_btn = st.button("🚀 Compare Profiles", type="secondary")
+
+        yoy_cache_key = f"yoy_{metric_col}_{base_date_input}_{target_date_input}_{growth_rate_input}"
+        if run_yoy_btn or (yoy_cache_key in st.session_state):
+            if run_yoy_btn or (yoy_cache_key not in st.session_state):
+                with st.spinner(f"Predicting 24-hour profile for {target_date_input} and comparing to {base_date_input}..."):
+                    forecaster = LoadForecaster()
+                    comp_df, yoy_metrics = forecaster.predict_and_compare_date_profiles(
+                        clean_df[clean_col],
+                        baseline_date=base_date_input,
+                        target_date=target_date_input,
+                        growth_rate_pct=growth_rate_input,
+                        target_name=metric_col
+                    )
+                    st.session_state[yoy_cache_key] = (comp_df, yoy_metrics)
+
+            comp_df, yoy_metrics = st.session_state[yoy_cache_key]
+
+            # 1. Comparative KPI Cards
+            ykpi1, ykpi2, ykpi3, ykpi4 = st.columns(4)
+            ykpi1.metric(
+                "Peak Demand (MW)",
+                f"{yoy_metrics['predicted_peak_mw']:.2f} MW",
+                f"{yoy_metrics['peak_delta_mw']:+.2f} MW ({yoy_metrics['peak_delta_pct']:+.1f}%) vs {yoy_metrics['baseline_date']}"
+            )
+            ykpi2.metric(
+                "Average Load (MW)",
+                f"{yoy_metrics['predicted_avg_mw']:.2f} MW",
+                f"{yoy_metrics['delta_avg_mw']:+.2f} MW vs {yoy_metrics['baseline_date']}"
+            )
+            ykpi3.metric(
+                "Daily Energy (MWh)",
+                f"{yoy_metrics['predicted_total_mwh']:.1f} MWh",
+                f"{yoy_metrics['energy_delta_mwh']:+.1f} MWh ({yoy_metrics['energy_delta_pct']:+.1f}%)"
+            )
+            ykpi4.metric(
+                "Scenario Growth",
+                f"{yoy_metrics['growth_rate_pct']:+.1f}%",
+                f"Peak Hour: {yoy_metrics['predicted_peak_hour']}"
+            )
+
+            # 2. Interactive Comparison Overlay Chart
+            fig_yoy = go.Figure()
+
+            # Baseline historical actual trace
+            fig_yoy.add_trace(go.Scatter(
+                x=comp_df["hour_label"],
+                y=comp_df["baseline_load_mw"],
+                mode="lines+markers",
+                name=f"Actual ({yoy_metrics['baseline_date']})",
+                line=dict(color="#1f77b4", width=2.5),
+                marker=dict(size=6, color="#1f77b4")
+            ))
+
+            # Predicted future trace
+            fig_yoy.add_trace(go.Scatter(
+                x=comp_df["hour_label"],
+                y=comp_df["predicted_load_mw"],
+                mode="lines+markers",
+                name=f"Predicted ({yoy_metrics['target_date']})",
+                line=dict(color="#ff7f0e", width=2.5, dash="dash"),
+                marker=dict(size=6, color="#ff7f0e", symbol="diamond")
+            ))
+
+            fig_yoy.update_layout(
+                title=f"24-Hour Diurnal Profile Comparison: {yoy_metrics['baseline_date']} (Actual) vs. {yoy_metrics['target_date']} (Predicted)",
+                xaxis_title="Hour of Day",
+                yaxis_title=f"{metric_col} (MW)",
+                template="plotly_white",
+                hovermode="x unified",
+                margin=dict(l=20, r=20, t=40, b=20),
+                height=420
+            )
+            st.plotly_chart(fig_yoy, use_container_width=True)
+
+            # 3. Side-by-Side Breakdown & CSV Export
+            st.markdown("#### 📊 Hourly Variance Table")
+            display_yoy = comp_df[["hour_label", "baseline_load_mw", "predicted_load_mw", "delta_mw", "delta_pct"]].copy()
+            display_yoy.columns = [
+                "Hour",
+                f"Actual {yoy_metrics['baseline_date']} (MW)",
+                f"Predicted {yoy_metrics['target_date']} (MW)",
+                "Variance (MW)",
+                "Variance (%)"
+            ]
+
+            st.dataframe(display_yoy, use_container_width=True, height=280)
+
+            yoy_csv = io.StringIO()
+            display_yoy.to_csv(yoy_csv, index=False)
+            st.download_button(
+                label="📥 Download YoY Comparison (CSV)",
+                data=yoy_csv.getvalue(),
+                file_name=f"yoy_forecast_{yoy_metrics['baseline_date']}_vs_{yoy_metrics['target_date']}.csv",
+                mime="text/csv"
+            )
+
     else:
         st.info("Upload energy telemetry to enable predictive load forecasting.")
 
